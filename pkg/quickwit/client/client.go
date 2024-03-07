@@ -10,6 +10,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
@@ -35,6 +36,7 @@ type ConfiguredFields struct {
 type Client interface {
 	GetConfiguredFields() ConfiguredFields
 	ExecuteMultisearch(r *MultiSearchRequest) (*MultiSearchResponse, error)
+	ExecuteSearch(r []*SearchRequest) ([]*SearchResponse, error)
 	MultiSearch() *MultiSearchRequestBuilder
 }
 
@@ -229,4 +231,79 @@ func (c *baseClientImpl) getMultiSearchQueryParameters() string {
 
 func (c *baseClientImpl) MultiSearch() *MultiSearchRequestBuilder {
 	return NewMultiSearchRequestBuilder()
+}
+
+func (c *baseClientImpl) ExecuteSearch(requests []*SearchRequest) ([]*SearchResponse, error) {
+	c.logger.Info("Executing search", "search requests", requests)
+
+	queryParam := ""
+	responses := make([]*SearchResponse, len(requests))
+	errors := make([]error, len(requests))
+	wg := sync.WaitGroup{}
+	for i, r := range requests {
+		wg.Add(1)
+		i := i
+		r := r
+		go func() {
+			defer wg.Done()
+			reqBody, err := r.MarshalJSON()
+			if err != nil {
+				errors[i] = err
+				return
+			}
+			body := string(reqBody)
+			body = strings.ReplaceAll(body, "$__interval_ms", strconv.FormatInt(r.Interval.Milliseconds(), 10))
+			body = strings.ReplaceAll(body, "$__interval", r.Interval.String())
+
+			clientRes, err := c.executeRequest(http.MethodPost, "_elastic/_search", queryParam, []byte(body))
+			if err != nil {
+				errors[i] = err
+				return
+			}
+			res := clientRes
+			defer func() {
+				if err := res.Body.Close(); err != nil {
+					c.logger.Warn("Failed to close response body", "err", err)
+				}
+			}()
+
+			c.logger.Debug("Received search response", "num", i, "code", res.StatusCode, "status", res.Status, "content-length", res.ContentLength)
+
+			if res.StatusCode >= 400 {
+				qe := QuickwitQueryError{
+					Status:       res.StatusCode,
+					Message:      "Error on search",
+					ResponseBody: res.Body,
+					QueryParam:   queryParam,
+					RequestBody:  requests,
+				}
+
+				errorPayload, _ := json.Marshal(qe)
+				c.logger.Error(string(errorPayload))
+				errors[i] = fmt.Errorf(string(errorPayload))
+			}
+
+			start := time.Now()
+			c.logger.Debug("Decoding search json response", "num", i)
+
+			var response SearchResponse
+			dec := json.NewDecoder(res.Body)
+			err = dec.Decode(&response)
+			if err != nil {
+				errors[i] = err
+			}
+
+			elapsed := time.Since(start)
+			c.logger.Debug("Decoded search json response", "num", i, "took", elapsed)
+			responses = append(responses, &response)
+		}()
+	}
+	wg.Wait()
+	for _, err := range errors {
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return responses, nil
 }

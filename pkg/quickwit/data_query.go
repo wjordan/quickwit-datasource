@@ -54,22 +54,22 @@ func (e *elasticsearchDataQuery) execute() (*backend.QueryDataResponse, error) {
 		return &backend.QueryDataResponse{}, err
 	}
 
-	ms := e.client.MultiSearch()
-
 	from := e.dataQueries[0].TimeRange.From.UnixNano() / int64(time.Millisecond)
 	to := e.dataQueries[0].TimeRange.To.UnixNano() / int64(time.Millisecond)
+	requests := make([]*es.SearchRequest, 0, len(queries))
 	for _, q := range queries {
-		if err := e.processQuery(q, ms, from, to); err != nil {
+		builder := es.NewSearchRequestBuilder(q.Interval)
+		if err := e.processQuery(q, builder, from, to); err != nil {
 			return &backend.QueryDataResponse{}, err
 		}
+		req, err := builder.Build()
+		if err != nil {
+			return &backend.QueryDataResponse{}, err
+		}
+		requests = append(requests, req)
 	}
 
-	req, err := ms.Build()
-	if err != nil {
-		return &backend.QueryDataResponse{}, err
-	}
-
-	res, err := e.client.ExecuteMultisearch(req)
+	res, err := e.client.ExecuteSearch(requests)
 	result, err := handleQuickwitErrors(e, err)
 	if result != nil {
 		return result, nil
@@ -77,17 +77,16 @@ func (e *elasticsearchDataQuery) execute() (*backend.QueryDataResponse, error) {
 		return &backend.QueryDataResponse{}, err
 	}
 
-	return parseResponse(res.Responses, queries, e.client.GetConfiguredFields())
+	return parseResponse(res, queries, e.client.GetConfiguredFields())
 }
 
-func (e *elasticsearchDataQuery) processQuery(q *Query, ms *es.MultiSearchRequestBuilder, from, to int64) error {
+func (e *elasticsearchDataQuery) processQuery(q *Query, b *es.SearchRequestBuilder, from, to int64) error {
 	err := isQueryWithError(q)
 	if err != nil {
 		return err
 	}
 
 	defaultTimeField := e.client.GetConfiguredFields().TimeField
-	b := ms.Search(q.Interval)
 	b.Size(0)
 	filters := b.Query().Bool().Filter()
 	filters.AddDateRangeFilter(defaultTimeField, to, from)
